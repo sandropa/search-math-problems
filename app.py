@@ -1,9 +1,10 @@
 """Math Problems Search — Streamlit app.
 
-Phase 1: syncs the Overleaf project (via its git bridge) once per app
-process and lists the .tex files found. Search and auth come later.
+Syncs the Overleaf project (via its git bridge) once per app process
+and provides grep-like search over the .tex files. Auth comes later.
 """
 
+import re
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -15,6 +16,10 @@ st.set_page_config(page_title="Math Problems Search")
 
 OVERLEAF_GIT_BASE = "https://git.overleaf.com"
 CLONE_TIMEOUT_S = 300
+CONTEXT_LINES = 2
+MAX_FILES_SHOWN = 50
+MAX_MATCHES_PER_FILE = 20
+MAX_TOTAL_MATCHES = 500
 
 
 def get_secret(key: str) -> str | None:
@@ -52,6 +57,100 @@ def clone_overleaf(project_id: str, token: str) -> dict:
     }
 
 
+@st.cache_data(show_spinner=False, ttl="1h")
+def search_files(repo_path: str, query: str) -> dict:
+    """Case-insensitive grep-like search over all .tex files."""
+    try:
+        pattern = re.compile(query, re.IGNORECASE)
+        literal_fallback = False
+    except re.error:
+        pattern = re.compile(re.escape(query), re.IGNORECASE)
+        literal_fallback = True
+
+    results = []
+    total = 0
+    truncated = False
+    for path in sorted(Path(repo_path).rglob("*.tex")):
+        if ".git" in path.parts:
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        matches = [(i + 1, line) for i, line in enumerate(lines) if pattern.search(line)]
+        if not matches:
+            continue
+        results.append({"path": path, "lines": lines, "matches": matches})
+        total += len(matches)
+        if total >= MAX_TOTAL_MATCHES:
+            truncated = True
+            break
+
+    return {
+        "results": results,
+        "total": total,
+        "literal_fallback": literal_fallback,
+        "truncated": truncated,
+    }
+
+
+def build_hunks(match_linenos: list[int], total_lines: int) -> list[tuple[int, int, set[int]]]:
+    """Merge matching line numbers into (start, end, match_lines) hunks with context."""
+    hunks: list[tuple[int, int, set[int]]] = []
+    for ln in match_linenos:
+        lo = max(1, ln - CONTEXT_LINES)
+        hi = min(total_lines, ln + CONTEXT_LINES)
+        if hunks and lo <= hunks[-1][1] + 1:
+            prev_lo, _, prev_matches = hunks[-1]
+            hunks[-1] = (prev_lo, hi, prev_matches | {ln})
+        else:
+            hunks.append((lo, hi, {ln}))
+    return hunks
+
+
+def render_results(search: dict, repo_path: Path) -> None:
+    results = search["results"]
+    if not results:
+        st.info("No matches found.")
+        return
+
+    st.write(f"**{search['total']}** matches in **{len(results)}** files")
+    notes = []
+    if search["literal_fallback"]:
+        notes.append("invalid regex — searched for the literal text instead")
+    if search["truncated"]:
+        notes.append(f"stopped after {MAX_TOTAL_MATCHES} matches")
+    if len(results) > MAX_FILES_SHOWN:
+        notes.append(f"showing first {MAX_FILES_SHOWN} files")
+    if notes:
+        st.caption("; ".join(notes).capitalize() + ".")
+
+    for res in results[:MAX_FILES_SHOWN]:
+        rel = res["path"].relative_to(repo_path)
+        matches = res["matches"]
+        st.markdown(f"**{rel}** ({len(matches)} matches)")
+        shown = matches[:MAX_MATCHES_PER_FILE]
+        for lo, hi, match_lines in build_hunks([n for n, _ in shown], len(res["lines"])):
+            block = [
+                f"{'>' if n in match_lines else ' '} {n:>4}: {res['lines'][n - 1]}"
+                for n in range(lo, hi + 1)
+            ]
+            st.code("\n".join(block), language="latex")
+        if len(matches) > MAX_MATCHES_PER_FILE:
+            st.caption(f"… and {len(matches) - MAX_MATCHES_PER_FILE} more matches in this file.")
+
+
+def search_input() -> str:
+    """Search field that reruns on every keystroke (falls back to Enter-based input)."""
+    label = "Search (regex supported)"
+    placeholder = r"e.g. tetivn|nejednakost"
+    try:
+        from st_keyup import st_keyup
+    except ImportError:
+        return st.text_input(label, placeholder=placeholder).strip()
+    return (st_keyup(label, placeholder=placeholder, debounce=300) or "").strip()
+
+
 def main() -> None:
     st.title("Math Problems Search")
 
@@ -80,9 +179,14 @@ def main() -> None:
         f"Last synced: {repo['synced_at']:%Y-%m-%d %H:%M:%S} UTC · "
         f"{repo['file_count']} files in project"
     )
-    st.subheader(f"{len(repo['tex_files'])} .tex files")
-    for path in repo["tex_files"]:
-        st.text(path.relative_to(repo["path"]))
+
+    query = search_input()
+
+    if not query:
+        return
+
+    search = search_files(str(repo["path"]), query)
+    render_results(search, repo["path"])
 
 
 if __name__ == "__main__":
